@@ -9,6 +9,16 @@
 #include "myMalloc.h"
 #include "printing.h"
 
+#define MIN_INDEX_SIZE (3)
+#define MIN_SIZE (32)
+
+static inline size_t max(size_t a, size_t b) {
+  return a > b ? a : b;
+}
+
+static inline size_t min(size_t a, size_t b) {
+  return a > b ? b : a;
+}
 
 /* Due to the way assert() prints error messges we use out own assert function
  * for deteminism when testing assertions
@@ -85,6 +95,42 @@ static inline header * verify_chunk(header * chunk);
 static inline bool verify_tags();
 
 
+// Helper function to get index in freelist
+
+static inline int get_freelist_index(size_t size) {
+  return min(size / sizeof(size_t) - MIN_INDEX_SIZE, N_LISTS - 1);
+}
+
+// Helper function to remove a block from its freelist
+
+static inline void remove_from_freelist(header* block) {
+  block->next->prev = block->prev;
+  block->prev->next = block->next;
+}
+
+// Helper function to add block to free list
+
+static inline void add_to_freelist(header * block) {
+  int idx = min(get_object_size(block) / sizeof(size_t) - MIN_INDEX_SIZE, N_LISTS - 1);
+  block->next = freelistSentinels[idx].next;
+  block->prev = &freelistSentinels[idx];
+  freelistSentinels[idx].next->prev = block;
+  freelistSentinels[idx].next = block;
+
+  // if the free list was empty
+  if (freelistSentinels[idx].prev == &freelistSentinels[idx]) {
+    freelistSentinels[idx].prev = block;
+  }
+} 
+
+// Helper function to coalesce two blocks
+
+static inline void coalesce_blocks(header* left, header* right) {
+  header* right_block = get_header_from_offset(right, get_object_size(right));
+  right_block->object_left_size = get_object_size(left) + get_object_size(right);
+  set_object_size(left, get_object_size(left) + get_object_size(right));
+  set_object_state(left, UNALLOCATED);
+}
 
 static void init();
 
@@ -199,16 +245,88 @@ static header * allocate_chunk(size_t size) {
 static inline header * allocate_object(size_t raw_size) {
   // Calculate req size
   if (raw_size == 0) return NULL;
-  size_t size = ((raw_size + 7) & ~0x7) + ALLOC_HEADER_SIZE;
-  if (size < 32) size = 32;
-  // search for index in freelist
-  int index = 58;
-  header* hdr = freelistSentinels[index].next;
-  header* to_return = get_header_from_offset(hdr, get_object_size(hdr) - size);
-  set_object_state(to_return, ALLOCATED);
-  set_object_size(to_return, size);
-  set_object_size(hdr, get_object_size(hdr) - size);
-  return to_return;
+  size_t required_size = ((raw_size + 7) & ~0x7) + ALLOC_HEADER_SIZE;
+  if (required_size < MIN_SIZE) required_size = MIN_SIZE;
+
+
+  header * mem = NULL;
+
+  // Searching for a free block
+  int idx = min(required_size / sizeof(size_t) - MIN_INDEX_SIZE, N_LISTS - 1);
+  int found = 1;
+  if (idx == N_LISTS - 1) {
+    header* temp = freelistSentinels[idx].next;
+    while (get_object_size(temp) < required_size && temp != &freelistSentinels[idx]) temp = temp->next;
+    if (get_object_size(temp) < required_size) found = 0;
+  } else {
+    while (idx < N_LISTS && freelistSentinels[idx].next == &freelistSentinels[idx]) {
+      idx++;
+    }
+    if (idx == N_LISTS) found = 0;
+  }
+  
+
+
+  header* my_block;
+  if (!found) {
+    // Allocating new chunks
+    mem = allocate_chunk(ARENA_SIZE);
+    if (numOsChunks >= 1 && get_right_header(lastFencePost) == get_left_header(mem)) {
+      header* left_block = get_header_from_offset(lastFencePost, -lastFencePost->object_left_size);
+      if (get_object_state(left_block) == UNALLOCATED) {
+        // combine the two fenceposts and left_block
+        remove_from_freelist(left_block);
+        set_object_size(left_block, get_object_size(left_block) + 2 * ALLOC_HEADER_SIZE + get_object_size(mem));
+        lastFencePost = get_right_header(mem);
+        mem = left_block;
+      } else {
+        // combine the fenceposts
+        set_object_state(lastFencePost, UNALLOCATED);
+        set_object_size(lastFencePost, get_object_size(lastFencePost) + ALLOC_HEADER_SIZE + get_object_size(mem));
+        mem = lastFencePost;
+        lastFencePost = get_right_header(mem);
+      }
+    } else {
+      insert_os_chunk(get_left_header(mem));
+      lastFencePost = get_right_header(mem);
+    }
+
+    set_object_size(mem, get_object_size(mem) - required_size);
+    set_object_state(mem, UNALLOCATED);
+    my_block = get_header_from_offset(mem, get_object_size(mem));
+    my_block->object_left_size = get_object_size(mem);
+    set_object_size(my_block, required_size);
+    add_to_freelist(mem);
+  } else {
+    // Found a free block
+    if (idx == N_LISTS - 1) {
+      header* temp = freelistSentinels[idx].next;
+      while (get_object_size(temp) < required_size) temp = temp->next;
+      mem = temp;
+    } else {
+      mem = freelistSentinels[idx].next;
+    }
+    size_t left = get_object_size(mem) - required_size;
+    if (left >= 32) {
+      set_object_size(mem, get_object_size(mem) - required_size);
+      int idx_to_change = min(get_object_size(mem) / sizeof(size_t) - MIN_INDEX_SIZE, N_LISTS - 1);
+      if (idx_to_change != idx) {
+        mem->next->prev = mem->prev;
+        mem->prev->next = mem->next;
+        add_to_freelist(mem);
+      }
+      my_block = get_header_from_offset(mem, get_object_size(mem));
+      my_block->object_left_size = get_object_size(mem);
+      set_object_size(my_block, required_size);
+    } else {
+      my_block = mem;
+      remove_from_freelist(mem);
+    }
+  }
+
+  set_object_state(my_block, ALLOCATED);
+  ((header *)((char *)my_block + get_object_size(my_block)))->object_left_size = get_object_size(my_block);
+  return my_block;
 }
 
 /**
@@ -229,13 +347,68 @@ static inline header * ptr_to_header(void * p) {
  */
 static inline void deallocate_object(void * p) {
   // TODO implement deallocation
+  // p points to data
+  // p's header is p - ALLOC_HEADER_SIZE
 
   header * block_to_free = ptr_to_header(p);
   if (get_object_state(block_to_free) == UNALLOCATED) {
     fprintf(stderr, "Double Free Detected\n");
     assert(false);
+    exit(1);
   }
   set_object_state(block_to_free, UNALLOCATED);
+  header* left_block = get_header_from_offset(block_to_free, -(block_to_free->object_left_size));
+  header* right_block = get_header_from_offset(block_to_free, get_object_size(block_to_free));
+
+  size_t left_size = get_object_size(left_block);
+  size_t right_size = get_object_size(right_block);
+
+  if (get_object_state(left_block) != UNALLOCATED && get_object_state(right_block) != UNALLOCATED) {
+      add_to_freelist(block_to_free);
+  } else {
+    // need to coalesce
+    if (get_object_state(right_block) == UNALLOCATED) {
+      // Coalescing with right
+      coalesce_blocks(block_to_free, right_block);
+    }
+    if (get_object_state(left_block) == UNALLOCATED) {
+      // Coalesce with left
+      coalesce_blocks(left_block, block_to_free);
+    }
+
+    if (get_object_state(left_block) == UNALLOCATED && get_object_state(right_block) == UNALLOCATED) {
+      if (get_freelist_index(left_size) == N_LISTS - 1) {
+        remove_from_freelist(right_block);
+      } else if (get_freelist_index(right_size) == N_LISTS - 1) {
+        remove_from_freelist(left_block);
+        left_block->next = right_block->next;
+        left_block->prev = right_block->prev;
+        right_block->next->prev = left_block;
+        right_block->prev->next = left_block;
+      } else {
+        remove_from_freelist(left_block);
+        remove_from_freelist(right_block);
+        add_to_freelist(left_block);
+      }
+    } else if (get_object_state(left_block) == UNALLOCATED) {
+      if (get_freelist_index(left_size) != N_LISTS - 1) {
+        remove_from_freelist(left_block);
+        add_to_freelist(left_block);
+      }
+    } else {
+      if (get_freelist_index(right_size) == N_LISTS - 1) {
+        remove_from_freelist(right_block);
+        right_block->next->prev = block_to_free;
+        right_block->prev->next = block_to_free;
+        block_to_free->next = right_block->next;
+        block_to_free->prev = right_block->prev;
+      } else {
+        remove_from_freelist(right_block);
+        add_to_freelist(block_to_free);
+      }
+    }
+
+  }
 }
 
 /**
@@ -387,9 +560,16 @@ static void init() {
  */
 void * my_malloc(size_t size) {
   pthread_mutex_lock(&mutex);
-  header * hdr = allocate_object(size);
+  header * hdr = NULL;
+  void *to_return;
+  if (size != 0) {
+    hdr  = allocate_object(size);
+    to_return = hdr->data;
+  } else {
+    to_return = NULL;
+  }
   pthread_mutex_unlock(&mutex);
-  return hdr->data;
+  return to_return;
 }
 
 void * my_calloc(size_t nmemb, size_t size) {
@@ -405,7 +585,7 @@ void * my_realloc(void * ptr, size_t size) {
 
 void my_free(void * p) {
   pthread_mutex_lock(&mutex);
-  deallocate_object(p);
+  if (p) deallocate_object(p);
   pthread_mutex_unlock(&mutex);
 }
 
